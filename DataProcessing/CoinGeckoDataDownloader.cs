@@ -33,6 +33,7 @@ using System.Threading.Tasks;
 
 namespace QuantConnect.DataProcessing
 {
+
     /// <summary>
     /// CoinGeckoUniverseDataDownloader implementation.
     /// </summary>
@@ -81,7 +82,9 @@ namespace QuantConnect.DataProcessing
             
             _client = new HttpClient();
             _client.BaseAddress = new Uri("https://pro-api.coingecko.com/api/v3/coins/");
+            //_client.BaseAddress = new Uri("https://api.coingecko.com/api/v3/coins/");
             _client.DefaultRequestHeaders.Add("x-cg-pro-api-key", apiKey);
+            //_client.DefaultRequestHeaders.Clear();
             // Responses are in JSON: you need to specify the HTTP header Accept: application/json
             _client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         }
@@ -93,42 +96,79 @@ namespace QuantConnect.DataProcessing
         public bool Run()
         {
             var stopwatch = Stopwatch.StartNew();
-
-            var coinGeckoList = GetCoinGeckoList();
+            var blacklist = GetBlackListId();
             var supported = GetSupportedCryptoCurrencies();
-            var universeData = new Dictionary<DateTime, List<string>>();
+            var coinGeckoList = GetCoinGeckoList(supported, blacklist);
+            var universeData = new Dictionary<DateTime, List<CoinGeckoItem>>();
 
             foreach (var coinGeckoItem in coinGeckoList)
             {
-                if (!supported.Remove(coinGeckoItem.Symbol)) continue;
-
-                var exists = File.Exists(Path.Combine(_processedFolder, $"{coinGeckoItem.Symbol.ToLowerInvariant()}.csv"));
+                var exists = File.Exists(Path.Combine(_processedFolder, $"{coinGeckoItem.Ticker.ToLowerInvariant()}.csv"));
                 var coinGeckoMarketChartsForId = GetCoinGeckoMarketChartsForId(coinGeckoItem.Id, exists);
-                var coinGeckoDictionary = coinGeckoMarketChartsForId.GetCoinGeckoDictionary();
-
-                string coinGeckoToString(CoinGecko coinGecko)
-                    => $"{coinGecko.EndTime:yyyyMMdd},{coinGecko.Price},{coinGecko.Volume},{coinGecko.MarketCap}";
-
-                SaveContentToFile(_destinationFolder, _processedFolder, coinGeckoItem.Symbol,
-                    coinGeckoDictionary.Select(x => coinGeckoToString(x.Value)));
+                var coinGeckoDictionary = coinGeckoMarketChartsForId.GetCoinGeckoDictionary(coinGeckoItem);
 
                 foreach (var (key, coinGecko) in coinGeckoDictionary)
                 {
                     if (!universeData.ContainsKey(key))
                     {
-                        universeData[key] = new List<string>();
+                        universeData[key] = new List<CoinGeckoItem>();
                     }
 
-                    universeData[key].Add($"{coinGeckoItem.Symbol.ToUpperInvariant()},{coinGecko.Price},{coinGecko.Volume},{coinGecko.MarketCap}");
+                    //coinGecko.Ticker = coinGeckoItem.Ticker;
+                    universeData[key].Add(coinGecko);
                 }
 
                 Log.Trace($"CoinGeckoUniverseDataDownloader.Run(): Processed: {coinGeckoItem}");
             }
 
-            foreach (var (date, content) in universeData)
+            var dictionary = new Dictionary<string, List<CoinGeckoItem>>();
+            
+            foreach (var (date, coins) in universeData)
             {
-                SaveContentToFile(_universeFolder, _processedUniverseFolder, $"{date:yyyyMMdd}", content);
+                var contents = coins.GroupBy(x => x.Ticker).Select(x =>
+                {
+                    var selected = x.OrderByDescending(x => x.MarketCap).First();
+
+                    if (x.Count() > 1)
+                    {
+                        foreach (var item in x)
+                        {
+                            if (item.Id != selected.Id)
+                            {
+                                blacklist.Add(item.Id);
+                                Log.Trace($"Added to the Blacklist {item.Ticker}, {item.Id}");
+                            }
+                        }
+                    }
+
+                    return selected;
+                }).ToList();
+
+                foreach (var coinGecko in contents)
+                {
+                    if (!dictionary.ContainsKey(coinGecko.Coin))
+                    {
+                        dictionary[coinGecko.Coin] = new List<CoinGeckoItem>();
+                    }
+
+                    dictionary[coinGecko.Coin].Add(coinGecko);
+                }
+
+                SaveContentToFile(_universeFolder, _processedUniverseFolder, $"{date:yyyyMMdd}",
+                    contents.Select(x => $"{x.Coin.ToUpperInvariant()},{x.Price},{x.Volume},{x.MarketCap}"));
             }
+
+            string coinGeckoToString(CoinGeckoItem coinGecko)
+                => $"{coinGecko.EndTime:yyyyMMdd},{coinGecko.Price},{coinGecko.Volume},{coinGecko.MarketCap}";
+
+            foreach (var (coin, coins) in dictionary)
+            {
+                SaveContentToFile(_destinationFolder, _processedFolder, coin,
+                    coins.Select(coinGeckoToString));
+            }
+
+            //save blacklisted to a file
+            SaveBlacklistToFile(blacklist);
 
             Log.Trace($"CoinGeckoUniverseDataDownloader.Run(): Finished in {stopwatch.Elapsed.ToStringInvariant(null)}");
             return true;
@@ -171,7 +211,7 @@ namespace QuantConnect.DataProcessing
         /// this data downloader and the rate limit of CoinGecko API is high 
         /// </summary>
         /// <returns>List of coins supported by CoinGecko</returns>
-        private List<CoinGeckoItem> GetCoinGeckoList()
+        private List<CoinGeckoItem> GetCoinGeckoList(HashSet<string> supported, HashSet<string> blacklist)
         {
             string value;
 
@@ -187,7 +227,9 @@ namespace QuantConnect.DataProcessing
 
             // Remove Wormhole duplicates
             var coinGeckoList = JsonConvert.DeserializeObject<List<CoinGeckoItem>>(value)
-                .GroupBy(x => x.Symbol)
+                .Where(x => supported.Contains(x.Ticker))
+                .Where(x => !blacklist.Contains(x.Id))
+                .GroupBy(x => x.Ticker)
                 .SelectMany(x => x.Where(y => !y.Name.ToLowerInvariant().Contains("wormhole")))
                 .ToList();
 
@@ -211,14 +253,35 @@ namespace QuantConnect.DataProcessing
             }
             else
             {
-                var days = exists ? $"{_lookback}" : "max";    // get all data available by "max" if not exist
-                var url = $"{id}/market_chart?vs_currency=usd&days={days}&interval=daily";
+                //var days = exists ? $"{_lookback}" : "max";    // get all data available by "max" if not exist
+                var url = $"{id}/market_chart/range?vs_currency=usd&from=631170000&to=1735707600";
                 value = HttpRequester(url).Result;
+                if (id == "bitcoin")
+                {
+                    Console.WriteLine("Handling specific logic for Bitcoin");
+                };
                 File.WriteAllText($"{id}.json", value);
             }
 
             return JsonConvert.DeserializeObject<CoinGeckoMarketChart>(value);
         }
+
+        private HashSet<string> GetBlackListId()
+        {
+            if (File.Exists($"{_processedFolder}/blacklist.csv"))
+            {
+                return File.ReadAllLines($"{_processedFolder}/blacklist.csv").ToHashSet();
+            }
+
+            return new HashSet<string>();
+        }
+
+        private void SaveBlacklistToFile(HashSet<string> blacklist)
+        {
+            File.WriteAllLines($"{_processedFolder}/blacklist.csv", blacklist);
+        }
+
+
 
         /// <summary>
         /// Sends a GET request for the provided URL
@@ -312,18 +375,18 @@ namespace QuantConnect.DataProcessing
         /// Represents items of the list of coins supported by CoinGecko
         /// https://api.coingecko.com/api/v3/coins/list
         /// </summary>
-        private class CoinGeckoItem
+        private class CoinGeckoItem:CoinGecko
         {
             [JsonProperty("id")]
             public string Id { get; set; }
             
             [JsonProperty("symbol")]
-            public string Symbol { get; set; }
+            public string Ticker { get; set; }
 
             [JsonProperty("name")]
             public string Name { get; set; }
 
-            public override string ToString() => $"{Id},{Symbol},{Name}";
+            public override string ToString() => $"{Id},{Ticker},{Name}";
         }
 
         /// <summary>
@@ -341,9 +404,9 @@ namespace QuantConnect.DataProcessing
             [JsonProperty("total_volumes")]
             public List<List<double?>> TotalVolumes { get; set; }
 
-            public Dictionary<DateTime, CoinGecko> GetCoinGeckoDictionary()
+            public Dictionary<DateTime, CoinGeckoItem> GetCoinGeckoDictionary(CoinGeckoItem coinGeckoItem)
             {
-                var coinGeckoDictionary = new Dictionary<DateTime, CoinGecko>();
+                var coinGeckoDictionary = new Dictionary<DateTime, CoinGeckoItem>();
 
                 foreach (var marketCap in MarketCaps)
                 {
@@ -351,13 +414,12 @@ namespace QuantConnect.DataProcessing
                     var endTime = Time.UnixTimeStampToDateTime(marketCap[0].Value / 1000d);
 
                     // Only record midnight data and discard data before 2013
-                    if (endTime.TimeOfDay > TimeSpan.Zero || endTime.Year < 2013) continue; 
+                    if (endTime.TimeOfDay > TimeSpan.Zero || endTime.Year < 2013) continue;
 
-                    coinGeckoDictionary[endTime] = new CoinGecko
-                    {
-                        EndTime = endTime,
-                        MarketCap = (marketCap[1] ?? 0).SafeDecimalCast()
-                    };
+                    coinGeckoItem.EndTime = endTime;
+                    coinGeckoItem.MarketCap = (marketCap[1] ?? 0).SafeDecimalCast();
+
+                    coinGeckoDictionary[endTime] = coinGeckoItem;
                 }
 
                 foreach (var price in Prices)
